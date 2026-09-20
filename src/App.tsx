@@ -9,8 +9,32 @@ import './App.css'
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
 
 type AssetKind = 'signature' | 'stamp'
-type Placement = { id: number; kind: AssetKind; src: string; name: string; x: number; y: number; width: number }
+type Placement = { id: number; kind: AssetKind; src: string; name: string; x: number; y: number; width: number; aspectRatio: number }
 type SavedAsset = { src: string; name: string }
+
+const readSavedAsset = (key: string): SavedAsset | null => {
+  if (typeof window === 'undefined') return null
+  try {
+    const value = window.localStorage.getItem(key)
+    return value ? JSON.parse(value) as SavedAsset : null
+  } catch {
+    return null
+  }
+}
+
+const getImageAspectRatio = async (src: string): Promise<number> => {
+  return new Promise((resolve) => {
+    const image = new Image()
+    image.onload = () => resolve(image.naturalWidth / Math.max(image.naturalHeight, 1))
+    image.onerror = () => resolve(1)
+    image.src = src
+  })
+}
+
+const getPlacementHeightPercent = (placement: Placement) => {
+  const ratio = placement.aspectRatio > 0 ? placement.aspectRatio : 1
+  return (placement.width / ratio) * 100
+}
 
 function App() {
   const [pdfFile, setPdfFile] = useState<File | null>(null)
@@ -19,8 +43,8 @@ function App() {
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [isDraggingOver, setIsDraggingOver] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
-  const [savedSignature, setSavedSignature] = useState<SavedAsset | null>(() => { const value = localStorage.getItem('signly-signature'); return value ? JSON.parse(value) as SavedAsset : null })
-  const [savedStamp, setSavedStamp] = useState<SavedAsset | null>(() => { const value = localStorage.getItem('signly-stamp'); return value ? JSON.parse(value) as SavedAsset : null })
+  const [savedSignature, setSavedSignature] = useState<SavedAsset | null>(() => readSavedAsset('signly-signature'))
+  const [savedStamp, setSavedStamp] = useState<SavedAsset | null>(() => readSavedAsset('signly-stamp'))
   const fileInputRef = useRef<HTMLInputElement>(null)
   const signatureInputRef = useRef<HTMLInputElement>(null)
   const stampInputRef = useRef<HTMLInputElement>(null)
@@ -55,14 +79,26 @@ function App() {
     void renderPage()
     return () => { cancelled = true }
   }, [pdfFile])
-  const addAsset = (event: ChangeEvent<HTMLInputElement>, kind: AssetKind) => {
+  const addAsset = async (event: ChangeEvent<HTMLInputElement>, kind: AssetKind) => {
     const file = event.target.files?.[0]
     if (!file || !file.type.startsWith('image/')) return
     const reader = new FileReader()
-    reader.onload = () => { const saved = { src: String(reader.result), name: file.name }; localStorage.setItem(kind === 'signature' ? 'signly-signature' : 'signly-stamp', JSON.stringify(saved)); if (kind === 'signature') setSavedSignature(saved); else setSavedStamp(saved); addSavedAsset(saved, kind) }
-    reader.readAsDataURL(file); event.target.value = ''
+    reader.onload = async () => {
+      const saved = { src: String(reader.result), name: file.name }
+      const aspectRatio = await getImageAspectRatio(saved.src)
+      window.localStorage.setItem(kind === 'signature' ? 'signly-signature' : 'signly-stamp', JSON.stringify(saved))
+      if (kind === 'signature') setSavedSignature(saved); else setSavedStamp(saved)
+      await addSavedAsset(saved, kind, aspectRatio)
+    }
+    reader.readAsDataURL(file)
+    event.target.value = ''
   }
-  const addSavedAsset = (saved: SavedAsset, kind: AssetKind) => { const item: Placement = { id: Date.now(), kind, src: saved.src, name: saved.name, x: kind === 'signature' ? 56 : 68, y: kind === 'signature' ? 74 : 10, width: kind === 'signature' ? 25 : 18 }; setPlacements((current) => [...current, item]); setSelectedId(item.id) }
+  const addSavedAsset = async (saved: SavedAsset, kind: AssetKind, aspectRatioOverride?: number) => {
+    const aspectRatio = aspectRatioOverride ?? await getImageAspectRatio(saved.src)
+    const item: Placement = { id: Date.now(), kind, src: saved.src, name: saved.name, x: kind === 'signature' ? 56 : 68, y: kind === 'signature' ? 74 : 10, width: kind === 'signature' ? 25 : 18, aspectRatio }
+    setPlacements((current) => [...current, item])
+    setSelectedId(item.id)
+  }
   const updateSelected = (changes: Partial<Placement>) => { setPlacements((current) => current.map((item) => item.id === selectedId ? { ...item, ...changes } : item)) }
   const adjustSelectedSize = (amount: number) => { if (selected) updateSelected({ width: Math.max(5, Math.min(70, selected.width + amount)) }) }
   const handlePointerDown = (event: PointerEvent<HTMLDivElement>, id: number) => {
@@ -70,7 +106,12 @@ function App() {
     const page = pageRef.current; const start = placements.find((item) => item.id === id)
     if (!page || !start) return
     const rect = page.getBoundingClientRect(); const startX = event.clientX; const startY = event.clientY
-    const move = (moveEvent: globalThis.PointerEvent) => { const nextX = Math.max(1, Math.min(99 - start.width, start.x + ((moveEvent.clientX - startX) / rect.width) * 100)); const nextY = Math.max(1, Math.min(98 - start.width * 0.55, start.y + ((moveEvent.clientY - startY) / rect.height) * 100)); setPlacements((current) => current.map((item) => item.id === id ? { ...item, x: nextX, y: nextY } : item)) }
+    const maxY = 100 - getPlacementHeightPercent(start)
+    const move = (moveEvent: globalThis.PointerEvent) => {
+      const nextX = Math.max(1, Math.min(99 - start.width, start.x + ((moveEvent.clientX - startX) / rect.width) * 100))
+      const nextY = Math.max(1, Math.min(maxY, start.y + ((moveEvent.clientY - startY) / rect.height) * 100))
+      setPlacements((current) => current.map((item) => item.id === id ? { ...item, x: nextX, y: nextY } : item))
+    }
     const stop = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop) }
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', stop)
   }
@@ -79,16 +120,38 @@ function App() {
     const page = pageRef.current; const start = placements.find((item) => item.id === id)
     if (!page || !start) return
     const rect = page.getBoundingClientRect(); const startX = event.clientX
-    const move = (moveEvent: globalThis.PointerEvent) => { const nextWidth = Math.max(5, Math.min(70, start.width + ((moveEvent.clientX - startX) / rect.width) * 100)); setPlacements((current) => current.map((item) => item.id === id ? { ...item, width: nextWidth } : item)) }
+    const move = (moveEvent: globalThis.PointerEvent) => {
+      const nextWidth = Math.max(5, Math.min(70, start.width + ((moveEvent.clientX - startX) / rect.width) * 100))
+      setPlacements((current) => current.map((item) => item.id === id ? { ...item, width: nextWidth } : item))
+    }
     const stop = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop) }
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', stop)
   }
   const exportPdf = async () => {
     if (!pdfFile) return
     setIsExporting(true)
-    const pdfDocument = await PDFDocument.load(await pdfFile.arrayBuffer()); const page = pdfDocument.getPage(0)
-    for (const placement of placements) { const imageBytes = await fetch(placement.src).then((response) => response.arrayBuffer()); const image = placement.src.includes('image/png') ? await pdfDocument.embedPng(imageBytes) : await pdfDocument.embedJpg(imageBytes); const width = placement.width / 100 * page.getWidth(); const height = width * image.height / image.width; page.drawImage(image, { x: placement.x / 100 * page.getWidth(), y: page.getHeight() - placement.y / 100 * page.getHeight() - height, width, height }) }
-    const bytes = await pdfDocument.save(); const downloadUrl = URL.createObjectURL(new Blob([bytes.buffer as ArrayBuffer], { type: 'application/pdf' })); const link = document.createElement('a'); link.href = downloadUrl; link.download = `${pdfFile.name.replace(/\.pdf$/i, '')}-signed.pdf`; link.click(); URL.revokeObjectURL(downloadUrl); setIsExporting(false)
+    const pdfDocument = await PDFDocument.load(await pdfFile.arrayBuffer())
+    const page = pdfDocument.getPage(0)
+    for (const placement of placements) {
+      const imageBytes = await fetch(placement.src).then((response) => response.arrayBuffer())
+      const image = placement.src.includes('image/png') ? await pdfDocument.embedPng(imageBytes) : await pdfDocument.embedJpg(imageBytes)
+      const width = placement.width / 100 * page.getWidth()
+      const height = width / (placement.aspectRatio > 0 ? placement.aspectRatio : 1)
+      page.drawImage(image, {
+        x: placement.x / 100 * page.getWidth(),
+        y: page.getHeight() - placement.y / 100 * page.getHeight() - height,
+        width,
+        height,
+      })
+    }
+    const bytes = await pdfDocument.save()
+    const downloadUrl = URL.createObjectURL(new Blob([bytes.buffer as ArrayBuffer], { type: 'application/pdf' }))
+    const link = document.createElement('a')
+    link.href = downloadUrl
+    link.download = `${pdfFile.name.replace(/\.pdf$/i, '')}-signed.pdf`
+    link.click()
+    URL.revokeObjectURL(downloadUrl)
+    setIsExporting(false)
   }
   const selected = placements.find((item) => item.id === selectedId)
 
@@ -100,7 +163,7 @@ function App() {
         <aside className="sidebar">
           <div className="panel-title"><div><span className="label">SOURCE FILE</span><h2>Your document</h2></div><span className="file-count">{pdfFile ? '1 / 1' : 'empty'}</span></div>
           <div className={`upload-zone ${isDraggingOver ? 'dragging' : ''} ${pdfFile ? 'has-file' : ''}`} onDragOver={(event) => { event.preventDefault(); setIsDraggingOver(true) }} onDragLeave={() => setIsDraggingOver(false)} onDrop={handleDrop} onClick={() => fileInputRef.current?.click()}><input ref={fileInputRef} type="file" accept="application/pdf" onChange={handlePdfChange} hidden />{pdfFile ? <><FileCheck2 className="upload-icon success" /><strong>{pdfFile.name}</strong><span>{(pdfFile.size / 1024 / 1024).toFixed(2)} MB · ready to edit</span><button className="text-button" type="button" onClick={(event) => { event.stopPropagation(); fileInputRef.current?.click() }}>Replace file</button></> : <><UploadCloud className="upload-icon" /><strong>Drop your PDF here</strong><span>or click to browse from your device</span><button className="browse-button" type="button">Choose PDF <FileUp size={15} /></button></>}</div>
-          <div className="asset-section"><div className="panel-title"><div><span className="label">MARKS</span><h2>Add to PDF</h2></div><span className="file-count">{placements.length} added</span></div><div className="asset-buttons"><button type="button" className="asset-button" onClick={() => signatureInputRef.current?.click()}><span className="asset-icon signature-icon"><MousePointer2 size={17} /></span><span><strong>{savedSignature ? 'Upload new signature' : 'Signature'}</strong><small>{savedSignature ? `Saved: ${savedSignature.name}` : 'PNG or JPG'}</small></span><ImagePlus size={16} /></button>{savedSignature && <button type="button" className="saved-button" onClick={() => addSavedAsset(savedSignature, 'signature')}><Check size={13} /> Use saved signature</button>}<button type="button" className="asset-button" onClick={() => stampInputRef.current?.click()}><span className="asset-icon stamp-icon"><Stamp size={17} /></span><span><strong>{savedStamp ? 'Upload new stamp' : 'Stamp'}</strong><small>{savedStamp ? `Saved: ${savedStamp.name}` : 'PNG or JPG'}</small></span><ImagePlus size={16} /></button>{savedStamp && <button type="button" className="saved-button" onClick={() => addSavedAsset(savedStamp, 'stamp')}><Check size={13} /> Use saved stamp</button>}<input ref={signatureInputRef} type="file" accept="image/png,image/jpeg" hidden onChange={(event) => addAsset(event, 'signature')} /><input ref={stampInputRef} type="file" accept="image/png,image/jpeg" hidden onChange={(event) => addAsset(event, 'stamp')} /></div></div>
+          <div className="asset-section"><div className="panel-title"><div><span className="label">MARKS</span><h2>Add to PDF</h2></div><span className="file-count">{placements.length} added</span></div><div className="asset-buttons"><button type="button" className="asset-button" onClick={() => signatureInputRef.current?.click()}><span className="asset-icon signature-icon"><MousePointer2 size={17} /></span><span><strong>{savedSignature ? 'Upload new signature' : 'Signature'}</strong><small>{savedSignature ? `Saved: ${savedSignature.name}` : 'PNG or JPG'}</small></span><ImagePlus size={16} /></button>{savedSignature && <button type="button" className="saved-button" onClick={() => void addSavedAsset(savedSignature, 'signature')}><Check size={13} /> Use saved signature</button>}<button type="button" className="asset-button" onClick={() => stampInputRef.current?.click()}><span className="asset-icon stamp-icon"><Stamp size={17} /></span><span><strong>{savedStamp ? 'Upload new stamp' : 'Stamp'}</strong><small>{savedStamp ? `Saved: ${savedStamp.name}` : 'PNG or JPG'}</small></span><ImagePlus size={16} /></button>{savedStamp && <button type="button" className="saved-button" onClick={() => void addSavedAsset(savedStamp, 'stamp')}><Check size={13} /> Use saved stamp</button>}<input ref={signatureInputRef} type="file" accept="image/png,image/jpeg" hidden onChange={(event) => void addAsset(event, 'signature')} /><input ref={stampInputRef} type="file" accept="image/png,image/jpeg" hidden onChange={(event) => void addAsset(event, 'stamp')} /></div></div>
           {selected && <div className="edit-section"><div className="panel-title"><div><span className="label">SELECTED MARK</span><h2>{selected.kind === 'signature' ? 'Signature' : 'Stamp'} settings</h2></div><button className="icon-button" title="Remove mark" onClick={() => { setPlacements((items) => items.filter((item) => item.id !== selected.id)); setSelectedId(null) }}><Trash2 size={15} /></button></div><div className="file-pill"><span className={`mini-mark ${selected.kind}`} /><span>{selected.name}</span></div><div className="size-control"><div className="size-heading"><span>Adjust size</span><output>{Math.round(selected.width)}%</output></div><div className="size-stepper"><button type="button" title="Make smaller" onClick={() => adjustSelectedSize(-2)}><Minus size={13} /></button><input aria-label="Mark size" type="range" min="5" max="70" value={selected.width} onChange={(event) => updateSelected({ width: Number(event.target.value) })} /><button type="button" title="Make larger" onClick={() => adjustSelectedSize(2)}><Plus size={13} /></button></div><small className="size-help">Drag the corner handle on the selected mark for free resizing.</small></div></div>}
         </aside>
         <div className="canvas-area"><div className="canvas-toolbar"><div><span className="label">PAGE PREVIEW</span><strong>{pdfFile ? pdfFile.name : 'No document selected'}</strong></div><div className="toolbar-meta"><span>Page 1 of 1</span><span className="zoom">Fit to view</span></div></div><div className="paper-stage" onClick={() => setSelectedId(null)}>{pdfFile ? <div className="paper" ref={pageRef} style={{ aspectRatio: `${pageSize.width} / ${pageSize.height}` }}><canvas ref={canvasRef} className="pdf-canvas" aria-label="Uploaded PDF page preview" />{placements.map((placement) => <div key={placement.id} className={`placement ${selectedId === placement.id ? 'selected' : ''}`} style={{ left: `${placement.x}%`, top: `${placement.y}%`, width: `${placement.width}%` }} onPointerDown={(event) => handlePointerDown(event, placement.id)}><img src={placement.src} alt={placement.kind} /><span className="handle" onPointerDown={(event) => handleResizeDown(event, placement.id)} /></div>)}</div> : <div className="empty-preview"><div className="empty-icon"><FileUp size={28} /></div><h2>Start with a PDF</h2><p>Your document preview will appear here. Upload a PDF from the panel to begin.</p><button className="browse-button dark" type="button" onClick={() => fileInputRef.current?.click()}>Upload PDF <UploadCloud size={16} /></button></div>}</div><div className="canvas-hint"><MousePointer2 size={14} /> Drag a mark to move it <span>·</span> Drag its corner or use the size controls to resize</div></div>
